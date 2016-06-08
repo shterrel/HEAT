@@ -1,0 +1,265 @@
+ heat_template_version: 2013-05-23
+
+ description: >
+   Deploy etcd cluster running docker swarm
+
+ parameters:
+   etcd_members:
+     description: Number of CoreOS machines to deploy as Kubernetes Minion
+     type: number
+     default: 3
+     constraints:
+     - range:
+         min: 2
+         max: 12
+       description: Must be between 2 and 12 servers.
+   flavor:
+     type: string
+     default: 4 GB General Purpose v1
+     constraints:
+     - allowed_values:
+       - 4 GB General Purpose v1
+       - 8 GB General Purpose v1
+       description: |
+         Must be a valid Rackspace Cloud Server flavor for the region you have
+         selected to deploy into.
+   keyname:
+     label: SSH Keyname
+     type: string
+     description: Name of keypair to be used for compute instance 
+   coreos_image:
+     type: string
+     description: Rackspace - CoreOS Stable
+     default: "40155f16-21d4-4ac1-ad65-c409d94b8c7c"
+   discovery_token:
+     label: Discovery Token
+     type: string
+     description: etcd2 discovery token
+   flannel_url:
+     type: string
+     description: Flannel binary
+     default: "http://68a7ce59e171b8da071e-25a70557004c921e51e4cb1d15be2e2a.r18.cf1.rackcdn.com/flanneld"
+   flannel_net_interface:
+     type: string
+     description: Network for flanneld service
+     default: "eth1"
+
+ resources:
+   coreos_cluster_uuid:
+     type: OS::Heat::RandomString
+
+   priv_network:
+     type: Rackspace::Cloud::Network
+     properties:
+       label: cluster-network
+       cidr: 192.168.50.0/24
+
+   swarm_manager:
+     type: OS::Nova::Server
+     properties:
+       key_name: { get_param: keyname }
+       image: { get_param: coreos_image }
+       flavor: { get_param: flavor }
+       name: "ESmanager"
+       networks:
+       - network: "00000000-0000-0000-0000-000000000000"
+       - network: { get_resource: priv_network }
+       user_data_format: RAW
+       config_drive: "true"
+       metadata:
+        build_config: "core"
+       user_data:
+         str_replace:
+           template: |
+             #cloud-config
+             write_files:
+               - path: /opt/fleet/docker-swarm.service
+                 permissions: 0644
+                 content: |
+                   # Startup docker swarm
+                   [Unit]
+                   Description=Starts up docker swarm
+                   [Service]
+                   EnvironmentFile=/etc/environment
+                   ExecStart=/usr/bin/docker -H ${COREOS_PRIVATE_IPV4}:2375 run swarm join --addr=${COREOS_PRIVATE_IPV4}:2375 etcd://${COREOS_PRIVATE_IPV4}:2379/swarm
+                   [X-Fleet]
+                   Global=True
+               - path: /opt/fleet/docker-manager.service
+                 permissions: 0644
+                 content: |
+                   # Startup docker swarm
+                   [Unit]
+                   Description=Starts up docker swarm
+                   [Service]
+                   ExecStart=/usr/bin/docker -H $private_ipv4:2375 run -p 8000:2375 swarm manage etcd://$private_ipv4:2379/swarm
+                   [X-Fleet]
+                   MachineMetadata=role=swarm_manager
+             coreos:
+               etcd2:
+                 name: manager
+                 discovery: https://discovery.etcd.io/%discovery_token%
+                 advertise-client-urls: http://$private_ipv4:2379,http://$private_ipv4:4001
+                 initial-advertise-peer-urls: http://$private_ipv4:2380
+                 listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+                 listen-peer-urls: http://$private_ipv4:2380
+               fleet:
+                 public-ip: $private_ipv4
+                 metadata: role=swarm_manager
+               update:
+                 group: stable
+                 reboot-strategy: off
+               units:
+                 - name: etcd2.service
+                   command: start
+                 - name: fleet.service
+                   command: start
+                 - name: flannel-install.service
+                   content: |
+                     # Installs flannel
+                     [Unit]
+                     After=network-online.target
+                     Requires=network-online.target
+                     After=etcd2.service
+                     Requires=etcd2.service
+                     [Service]
+                     Type=oneshot
+                     RemainAfterExit=yes
+                     ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+                     ExecStartPre=/usr/bin/wget -N -P /opt/bin %flannel_url%
+                     ExecStartPre=/usr/bin/chmod +x /opt/bin/flanneld
+                     ExecStart=/usr/bin/etcdctl set /coreos.com/network/config '{"Network": "172.16.0.0/16", "Backend": {"Type":"vxlan"}}'
+                   command: start
+                 - name: flanneld.service
+                   content: |
+                     [Unit]
+                     After=network-online.target
+                     Requires=network-online.target
+                     After=flannel-install.service
+                     Description=flannel is an etcd backed overlay network for containers
+                     [Service]
+                     Type=notify
+                     ExecStart=/opt/bin/flanneld -iface=%flannel_net_interface%
+                     Restart=always
+                     RestartSec=20s
+                     [Install]
+                     WantedBy=multi-user.target
+                   command: start
+                 - name: docker.service
+                   content: |
+                     [Unit]
+                     After=flanneld.service
+                     Requires=flanneld.service
+                     Description=Docker Application Container Engine
+                     Documentation=http://docs.docker.io
+                     [Service]
+                     Type=notify
+                     EnvironmentFile=/run/flannel/subnet.env
+                     ExecStart=/usr/bin/docker daemon -H $private_ipv4:2375 -H unix:///var/run/docker.sock --bip=${FLANNEL_SUBNET} --mtu=${FLANNEL_MTU}
+                     [Install]
+                     WantedBy=multi-user.target
+                   command: start
+           params:
+             "%uuid%": { get_attr: [coreos_cluster_uuid, value] }
+             "%flannel_url%": { get_param: flannel_url }
+             "%flannel_net_interface%": { get_param: flannel_net_interface }
+             "%discovery_token%": { get_param: discovery_token }
+
+
+   etcd_workers:
+     type: "OS::Heat::ResourceGroup"
+     properties:
+       count: { get_param: etcd_members }
+       resource_def:
+         type: OS::Nova::Server
+         properties:
+           key_name: { get_param: keyname }
+           image: { get_param: coreos_image }
+           flavor: { get_param: flavor }
+           name: ESnode-%index%
+           networks:
+           - network: "00000000-0000-0000-0000-000000000000"
+           - network: { get_resource: priv_network }
+           user_data_format: RAW
+           config_drive: "true"
+           metadata:
+            build_config: "core"
+           user_data:
+             str_replace:
+               template: |
+                 #cloud-config
+                 coreos:
+                   etcd2:
+                     name: worker_%index%
+                     discovery: https://discovery.etcd.io/%discovery_token%
+                     advertise-client-urls: http://$private_ipv4:2379,http://$private_ipv4:4001
+                     initial-advertise-peer-urls: http://$private_ipv4:2380
+                     listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+                     listen-peer-urls: http://$private_ipv4:2380
+                   fleet:
+                     public-ip: $private_ipv4
+                     metadata: role=sworker
+                   update:
+                     group: stable
+                     reboot-strategy: off
+                   units:
+                     - name: etcd2.service
+                       command: start
+                     - name: fleet.service
+                       command: start
+                     - name: flannel-install.service
+                       content: |
+                         # Installs flannel
+                         [Unit]
+                         After=network-online.target
+                         Requires=network-online.target
+                         After=etcd2.service
+                         Requires=etcd2.service
+                         [Service]
+                         Type=oneshot
+                         RemainAfterExit=yes
+                         ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+                         ExecStartPre=/usr/bin/wget -N -P /opt/bin %flannel_url%
+                         ExecStartPre=/usr/bin/chmod +x /opt/bin/flanneld
+                         ExecStart=/usr/bin/etcdctl set /coreos.com/network/config '{"Network": "172.16.0.0/16", "Backend": {"Type":"vxlan"}}'
+                       command: start
+                     - name: flanneld.service
+                       content: |
+                         [Unit]
+                         After=network-online.target
+                         Requires=network-online.target
+                         After=flannel-install.service
+                         Description=flannel is an etcd backed overlay network for containers
+                         [Service]
+                         Type=notify
+                         ExecStart=/opt/bin/flanneld -iface=%flannel_net_interface%
+                         Restart=always
+                         RestartSec=20s
+                         [Install]
+                         WantedBy=multi-user.target
+                       command: start
+                     - name: docker.service
+                       content: |
+                         [Unit]
+                         After=flanneld.service
+                         Requires=flanneld.service
+                         Description=Docker Application Container Engine
+                         Documentation=http://docs.docker.io
+                         [Service]
+                         Type=notify
+                         EnvironmentFile=/run/flannel/subnet.env
+                         ExecStart=/usr/bin/docker daemon -H $private_ipv4:2375 -H unix:///var/run/docker.sock --bip=${FLANNEL_SUBNET} --mtu=${FLANNEL_MTU}
+                         [Install]
+                         WantedBy=multi-user.target
+                       command: start
+               params:
+                 "%uuid%": { get_attr: [coreos_cluster_uuid, value] }
+                 "%flannel_url%": { get_param: flannel_url }
+                 "%flannel_net_interface%": { get_param: flannel_net_interface }
+                 "%discovery_token%": { get_param: discovery_token }
+
+ outputs:
+   node_ips:
+     value: { get_attr: [ etcd_workers, accessIPv4 ] }
+     description: The IP of the etcd nodes
+   master_ip:
+     value: { get_attr: [ swarm_manager, accessIPv4 ] }
