@@ -1,0 +1,97 @@
+heat_template_version: 2013-05-23
+
+description: >
+  Deploy etcd cluster with fleet
+
+parameters:
+  etcd_members:
+    label: Server Count
+    description: Number of CoreOS machines to deploy as Kubernetes Minion
+    type: number
+    default: 3
+    constraints:
+    - range:
+        min: 2
+        max: 12
+      description: Must be between 2 and 12 servers.
+  keyname:
+    label: SSH keyname
+    type: string
+    description: Name of keypair to be used for compute instance
+  discovery_token:
+    label: Discovery Token
+    type: string
+    description: etcd2 discovery token
+  flavor:
+    label: Flavor
+    type: string
+    default: 4 GB General Purpose v1
+    constraints:
+    - allowed_values:
+      - 4 GB General Purpose v1
+      - 8 GB General Purpose v1
+      description: |
+        Must be a valid Rackspace Cloud Server flavor for the region you have
+        selected to deploy into.
+  coreos_image:
+    label: CoreOS image
+    type: string
+    description: Rackspace - CoreOS Stable
+    default: "292f2f2f-f609-43de-bcd7-ec8cb4a970bc"
+
+resources:
+  coreos_cluster_uuid:
+    type: OS::Heat::RandomString
+
+  priv_network:
+    type: Rackspace::Cloud::Network
+    properties:
+      label: etcdcluster
+      cidr: 192.168.50.0/24
+
+  etcd_minions:
+    type: "OS::Heat::ResourceGroup"
+    properties:
+      count: { get_param: etcd_members }
+      resource_def:
+        type: OS::Nova::Server
+        properties:
+          key_name: { get_param: keyname }
+          image: { get_param: coreos_image }
+          flavor: { get_param: flavor }
+          name: coreos-%index%
+          networks:
+          - uuid: "00000000-0000-0000-0000-000000000000"
+          - uuid: { get_resource: priv_network }
+          user_data_format: RAW
+          config_drive: "true"
+          user_data:
+            str_replace:
+              template: |
+                #cloud-config
+                coreos:
+                  etcd2:
+                    name: coreos_%index%
+                    discovery: https://discovery.etcd.io/%discovery_token%
+                    advertise-client-urls: http://$private_ipv4:2379,http://$private_ipv4:4001
+                    initial-advertise-peer-urls: http://$private_ipv4:2380
+                    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+                    listen-peer-urls: http://$private_ipv4:2380
+                  fleet:
+                    public-ip: $private_ipv4
+                  update:
+                    group: stable
+                    reboot-strategy: off
+                  units:
+                    - name: etcd2.service
+                      command: start
+                    - name: fleet.service
+                      command: start
+              params:
+                "%uuid%": { get_attr: [coreos_cluster_uuid, value] }
+                "%discovery_token%": { get_param: discovery_token }
+
+outputs:
+  node_ips:
+    value: { get_attr: [ etcd_minions, accessIPv4 ] }
+    description: The IP of the etcd nodes
